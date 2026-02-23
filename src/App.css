@@ -143,6 +143,7 @@
   padding: 1rem;
   border-radius: 16px;
   border: 1px solid var(--border);
+  flex-wrap: wrap;
 }
 
 .nav button {
@@ -165,15 +166,41 @@
   box-shadow: 0 4px 12px rgba(0, 217, 255, 0.3);
 }
 
-.export-btn {
+.nav-actions {
   margin-left: auto;
-  background: var(--accent-secondary) !important;
-  color: white !important;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.import-btn {
+  padding: 0.75rem 1.5rem;
+  border-radius: 12px;
+  background: var(--accent-success);
+  color: white;
   font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  font-size: 1rem;
+  display: inline-block;
+}
+
+.import-btn:hover {
+  background: #059669;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+}
+
+.export-btn {
+  padding: 0.75rem 1.5rem;
+  border-radius: 12px;
+  background: var(--accent-secondary);
+  color: white;
+  font-weight: 600;
+  font-size: 1rem;
 }
 
 .export-btn:hover {
-  background: #6d28d9 !important;
+  background: #6d28d9;
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(124, 58, 237, 0.4);
 }

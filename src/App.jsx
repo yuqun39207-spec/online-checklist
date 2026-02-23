@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react'
 import { format, parseISO, isToday, isBefore, startOfDay } from 'date-fns'
 import * as XLSX from 'xlsx'
-import { supabase } from './supabaseClient'
 import './App.css'
 
 const CATEGORIES = [
@@ -17,7 +16,6 @@ function App() {
   const [view, setView] = useState('today')
   const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'))
   const [items, setItems] = useState([])
-  const [loading, setLoading] = useState(true)
   const [activeCategory, setActiveCategory] = useState(null)
   const [editingItem, setEditingItem] = useState(null)
   const [formData, setFormData] = useState({
@@ -27,64 +25,21 @@ function App() {
     plannedCompletionTime: ''
   })
 
-  // 从云端加载数据
-  const loadItems = async () => {
-    try {
-      setLoading(true)
-      const { data, error } = await supabase
-        .from('checklist_items')
-        .select('*')
-        .order('created_at', { ascending: false })
-
-      if (error) throw error
-
-      // 转换数据格式以匹配前端
-      const formattedItems = data.map(item => ({
-        id: item.id,
-        category: item.category,
-        content: item.content,
-        registrant: item.registrant,
-        registeredAt: item.registered_at,
-        executor: item.executor,
-        date: item.date,
-        plannedCompletionTime: item.planned_completion_time,
-        completed: item.completed,
-        completedAt: item.completed_at,
-        completedBy: item.completed_by
-      }))
-
-      setItems(formattedItems)
-    } catch (error) {
-      console.error('加载数据失败:', error)
-      alert('加载数据失败，请刷新页面重试')
-    } finally {
-      setLoading(false)
-    }
-  }
-
   useEffect(() => {
     const savedUser = localStorage.getItem('currentUser')
     if (savedUser) {
       setCurrentUser(savedUser)
     }
     
-    loadItems()
-
-    // 实时监听数据变化
-    const subscription = supabase
-      .channel('checklist_changes')
-      .on('postgres_changes', 
-        { event: '*', schema: 'public', table: 'checklist_items' },
-        () => {
-          loadItems()
-        }
-      )
-      .subscribe()
-
-    return () => {
-      subscription.unsubscribe()
+    const saved = localStorage.getItem('checklistItems')
+    if (saved) {
+      setItems(JSON.parse(saved))
     }
   }, [])
+
+  useEffect(() => {
+    localStorage.setItem('checklistItems', JSON.stringify(items))
+  }, [items])
 
   const handleLogin = () => {
     if (!loginName.trim()) {
@@ -103,7 +58,7 @@ function App() {
     }
   }
 
-  const addItem = async () => {
+  const addItem = () => {
     const isOtherCategory = formData.category === 'other'
     
     if (!formData.content) {
@@ -111,53 +66,40 @@ function App() {
       return
     }
 
-    try {
-      if (editingItem) {
-        // 更新现有事项
-        const { error } = await supabase
-          .from('checklist_items')
-          .update({
-            content: formData.content,
-            date: formData.date,
-            planned_completion_time: formData.plannedCompletionTime || null,
-            executor: isOtherCategory ? formData.executor : null
-          })
-          .eq('id', editingItem.id)
-
-        if (error) throw error
-        setEditingItem(null)
-      } else {
-        // 新增事项
-        const { error } = await supabase
-          .from('checklist_items')
-          .insert([{
-            category: formData.category,
-            content: formData.content,
-            registrant: currentUser,
-            registered_at: new Date().toISOString(),
-            executor: isOtherCategory ? formData.executor : null,
-            date: formData.date,
-            planned_completion_time: formData.plannedCompletionTime || null,
-            completed: false
-          }])
-
-        if (error) throw error
+    if (editingItem) {
+      setItems(items.map(item => 
+        item.id === editingItem.id 
+          ? {
+              ...item,
+              content: formData.content,
+              date: formData.date,
+              plannedCompletionTime: formData.plannedCompletionTime,
+              executor: isOtherCategory ? formData.executor : item.executor
+            }
+          : item
+      ))
+      setEditingItem(null)
+    } else {
+      const newItem = {
+        id: Date.now(),
+        ...formData,
+        registrant: currentUser,
+        registeredAt: new Date().toISOString(),
+        completed: false,
+        completedAt: null,
+        completedBy: null,
+        executor: isOtherCategory ? formData.executor : null
       }
-
-      setActiveCategory(null)
-      setFormData({
-        category: 'params',
-        content: '',
-        date: format(new Date(), 'yyyy-MM-dd'),
-        plannedCompletionTime: ''
-      })
-
-      // 重新加载数据
-      await loadItems()
-    } catch (error) {
-      console.error('保存失败:', error)
-      alert('保存失败，请重试')
+      setItems([...items, newItem])
     }
+
+    setActiveCategory(null)
+    setFormData({
+      category: 'params',
+      content: '',
+      date: format(new Date(), 'yyyy-MM-dd'),
+      plannedCompletionTime: ''
+    })
   }
 
   const openAddForm = (categoryId) => {
@@ -189,28 +131,17 @@ function App() {
     setEditingItem(null)
   }
 
-  const toggleComplete = async (id) => {
-    const item = items.find(i => i.id === id)
-    if (!item) return
-
-    try {
-      const { error } = await supabase
-        .from('checklist_items')
-        .update({
-          completed: !item.completed,
-          completed_at: !item.completed ? new Date().toISOString() : null,
-          completed_by: !item.completed ? currentUser : null
-        })
-        .eq('id', id)
-
-      if (error) throw error
-
-      // 重新加载数据
-      await loadItems()
-    } catch (error) {
-      console.error('更新状态失败:', error)
-      alert('更新失败，请重试')
-    }
+  const toggleComplete = (id) => {
+    setItems(items.map(item => 
+      item.id === id 
+        ? { 
+            ...item, 
+            completed: !item.completed, 
+            completedAt: !item.completed ? new Date().toISOString() : null,
+            completedBy: !item.completed ? currentUser : null
+          }
+        : item
+    ))
   }
 
   const exportToExcel = () => {
@@ -238,22 +169,57 @@ function App() {
     XLSX.writeFile(wb, fileName)
   }
 
-  const deleteItem = async (id) => {
-    if (!confirm('确定删除此事项？')) return
+  // 导出数据为JSON（用于团队同步）
+  const exportData = () => {
+    const dataStr = JSON.stringify(items, null, 2)
+    const dataBlob = new Blob([dataStr], { type: 'application/json' })
+    const url = URL.createObjectURL(dataBlob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `清单数据_${format(new Date(), 'yyyyMMdd_HHmmss')}.json`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
 
-    try {
-      const { error } = await supabase
-        .from('checklist_items')
-        .delete()
-        .eq('id', id)
+  // 导入数据（用于团队同步）
+  const importData = (event) => {
+    const file = event.target.files[0]
+    if (!file) return
 
-      if (error) throw error
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const importedItems = JSON.parse(e.target.result)
+        
+        // 合并数据：保留本地新数据，导入远程数据
+        const mergedItems = [...items]
+        const existingIds = new Set(items.map(item => item.id))
+        
+        importedItems.forEach(importedItem => {
+          if (!existingIds.has(importedItem.id)) {
+            mergedItems.push(importedItem)
+          } else {
+            // 如果ID存在，更新为最新的数据
+            const index = mergedItems.findIndex(item => item.id === importedItem.id)
+            if (index !== -1) {
+              mergedItems[index] = importedItem
+            }
+          }
+        })
+        
+        setItems(mergedItems)
+        alert('数据导入成功！')
+      } catch (error) {
+        alert('导入失败，请确保文件格式正确')
+      }
+    }
+    reader.readAsText(file)
+    event.target.value = '' // 清空input，允许重复导入同一文件
+  }
 
-      // 重新加载数据
-      await loadItems()
-    } catch (error) {
-      console.error('删除失败:', error)
-      alert('删除失败，请重试')
+  const deleteItem = (id) => {
+    if (confirm('确定删除此事项？')) {
+      setItems(items.filter(item => item.id !== id))
     }
   }
 
@@ -304,17 +270,6 @@ function App() {
     )
   }
 
-  if (loading) {
-    return (
-      <div className="login-container">
-        <div className="login-box fade-in">
-          <h1>📋 在线清单管理系统</h1>
-          <p className="login-subtitle">加载中...</p>
-        </div>
-      </div>
-    )
-  }
-
   return (
     <div className="app">
       <header className="header fade-in">
@@ -349,9 +304,23 @@ function App() {
         >
           📅 日历查看
         </button>
-        <button onClick={exportToExcel} className="export-btn" title="导出Excel">
-          📊 导出
-        </button>
+        <div className="nav-actions">
+          <label className="import-btn" title="导入数据">
+            📥 导入
+            <input 
+              type="file" 
+              accept=".json" 
+              onChange={importData}
+              style={{ display: 'none' }}
+            />
+          </label>
+          <button onClick={exportData} className="export-btn" title="导出数据（JSON）">
+            💾 导出数据
+          </button>
+          <button onClick={exportToExcel} className="export-btn" title="导出Excel">
+            📊 导出Excel
+          </button>
+        </div>
       </nav>
 
       {view === 'calendar' && (
