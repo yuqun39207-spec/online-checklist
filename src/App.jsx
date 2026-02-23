@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { format, parseISO, isToday, isBefore, startOfDay } from 'date-fns'
 import * as XLSX from 'xlsx'
+import { supabase, retryRequest } from './supabaseClient'
 import './App.css'
 
 const CATEGORIES = [
@@ -16,6 +17,9 @@ function App() {
   const [view, setView] = useState('today')
   const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'))
   const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [isOnline, setIsOnline] = useState(true)
+  const [syncStatus, setSyncStatus] = useState('synced') // synced, syncing, offline
   const [activeCategory, setActiveCategory] = useState(null)
   const [editingItem, setEditingItem] = useState(null)
   const [formData, setFormData] = useState({
@@ -25,21 +29,117 @@ function App() {
     plannedCompletionTime: ''
   })
 
+  // 从本地缓存加载数据
+  const loadFromCache = () => {
+    const cached = localStorage.getItem('checklistItems_cache')
+    if (cached) {
+      try {
+        const cachedItems = JSON.parse(cached)
+        setItems(cachedItems)
+        return cachedItems
+      } catch (e) {
+        console.error('加载缓存失败:', e)
+      }
+    }
+    return []
+  }
+
+  // 保存到本地缓存
+  const saveToCache = (data) => {
+    try {
+      localStorage.setItem('checklistItems_cache', JSON.stringify(data))
+      localStorage.setItem('checklistItems_cache_time', new Date().toISOString())
+    } catch (e) {
+      console.error('保存缓存失败:', e)
+    }
+  }
+
+  // 从云端加载数据（带重试）
+  const loadItems = async (showLoading = true) => {
+    try {
+      if (showLoading) setLoading(true)
+      setSyncStatus('syncing')
+      
+      const result = await retryRequest(async () => {
+        return await supabase
+          .from('checklist_items')
+          .select('*')
+          .order('created_at', { ascending: false })
+      })
+
+      if (result.error) throw result.error
+
+      const formattedItems = result.data.map(item => ({
+        id: item.id,
+        category: item.category,
+        content: item.content,
+        registrant: item.registrant,
+        registeredAt: item.registered_at,
+        executor: item.executor,
+        date: item.date,
+        plannedCompletionTime: item.planned_completion_time,
+        completed: item.completed,
+        completedAt: item.completed_at,
+        completedBy: item.completed_by
+      }))
+
+      setItems(formattedItems)
+      saveToCache(formattedItems)
+      setIsOnline(true)
+      setSyncStatus('synced')
+    } catch (error) {
+      console.error('加载数据失败:', error)
+      setIsOnline(false)
+      setSyncStatus('offline')
+      
+      // 使用缓存数据
+      const cachedItems = loadFromCache()
+      if (cachedItems.length > 0) {
+        console.log('使用缓存数据')
+      }
+    } finally {
+      if (showLoading) setLoading(false)
+    }
+  }
+
   useEffect(() => {
     const savedUser = localStorage.getItem('currentUser')
     if (savedUser) {
       setCurrentUser(savedUser)
     }
     
-    const saved = localStorage.getItem('checklistItems')
-    if (saved) {
-      setItems(JSON.parse(saved))
+    // 先加载缓存
+    loadFromCache()
+    
+    // 然后尝试从云端加载
+    loadItems()
+
+    // 设置定期同步（每30秒）
+    const syncInterval = setInterval(() => {
+      if (isOnline) {
+        loadItems(false)
+      }
+    }, 30000)
+
+    // 监听网络状态
+    const handleOnline = () => {
+      setIsOnline(true)
+      loadItems(false)
+    }
+    const handleOffline = () => {
+      setIsOnline(false)
+      setSyncStatus('offline')
+    }
+
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+
+    return () => {
+      clearInterval(syncInterval)
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
     }
   }, [])
-
-  useEffect(() => {
-    localStorage.setItem('checklistItems', JSON.stringify(items))
-  }, [items])
 
   const handleLogin = () => {
     if (!loginName.trim()) {
@@ -58,7 +158,7 @@ function App() {
     }
   }
 
-  const addItem = () => {
+  const addItem = async () => {
     const isOtherCategory = formData.category === 'other'
     
     if (!formData.content) {
@@ -66,40 +166,62 @@ function App() {
       return
     }
 
-    if (editingItem) {
-      setItems(items.map(item => 
-        item.id === editingItem.id 
-          ? {
-              ...item,
-              content: formData.content,
-              date: formData.date,
-              plannedCompletionTime: formData.plannedCompletionTime,
-              executor: isOtherCategory ? formData.executor : item.executor
-            }
-          : item
-      ))
-      setEditingItem(null)
-    } else {
-      const newItem = {
-        id: Date.now(),
-        ...formData,
-        registrant: currentUser,
-        registeredAt: new Date().toISOString(),
-        completed: false,
-        completedAt: null,
-        completedBy: null,
-        executor: isOtherCategory ? formData.executor : null
-      }
-      setItems([...items, newItem])
+    const newItem = {
+      category: formData.category,
+      content: formData.content,
+      registrant: currentUser,
+      registered_at: new Date().toISOString(),
+      executor: isOtherCategory ? formData.executor : null,
+      date: formData.date,
+      planned_completion_time: formData.plannedCompletionTime || null,
+      completed: false
     }
 
-    setActiveCategory(null)
-    setFormData({
-      category: 'params',
-      content: '',
-      date: format(new Date(), 'yyyy-MM-dd'),
-      plannedCompletionTime: ''
-    })
+    try {
+      setSyncStatus('syncing')
+      
+      if (editingItem) {
+        // 更新
+        const result = await retryRequest(async () => {
+          return await supabase
+            .from('checklist_items')
+            .update({
+              content: formData.content,
+              date: formData.date,
+              planned_completion_time: formData.plannedCompletionTime || null,
+              executor: isOtherCategory ? formData.executor : null
+            })
+            .eq('id', editingItem.id)
+        })
+
+        if (result.error) throw result.error
+        setEditingItem(null)
+      } else {
+        // 新增
+        const result = await retryRequest(async () => {
+          return await supabase
+            .from('checklist_items')
+            .insert([newItem])
+        })
+
+        if (result.error) throw result.error
+      }
+
+      setActiveCategory(null)
+      setFormData({
+        category: 'params',
+        content: '',
+        date: format(new Date(), 'yyyy-MM-dd'),
+        plannedCompletionTime: ''
+      })
+
+      await loadItems(false)
+      setSyncStatus('synced')
+    } catch (error) {
+      console.error('保存失败:', error)
+      setSyncStatus('offline')
+      alert('保存失败，请检查网络连接后重试')
+    }
   }
 
   const openAddForm = (categoryId) => {
@@ -131,17 +253,33 @@ function App() {
     setEditingItem(null)
   }
 
-  const toggleComplete = (id) => {
-    setItems(items.map(item => 
-      item.id === id 
-        ? { 
-            ...item, 
-            completed: !item.completed, 
-            completedAt: !item.completed ? new Date().toISOString() : null,
-            completedBy: !item.completed ? currentUser : null
-          }
-        : item
-    ))
+  const toggleComplete = async (id) => {
+    const item = items.find(i => i.id === id)
+    if (!item) return
+
+    try {
+      setSyncStatus('syncing')
+      
+      const result = await retryRequest(async () => {
+        return await supabase
+          .from('checklist_items')
+          .update({
+            completed: !item.completed,
+            completed_at: !item.completed ? new Date().toISOString() : null,
+            completed_by: !item.completed ? currentUser : null
+          })
+          .eq('id', id)
+      })
+
+      if (result.error) throw result.error
+
+      await loadItems(false)
+      setSyncStatus('synced')
+    } catch (error) {
+      console.error('更新状态失败:', error)
+      setSyncStatus('offline')
+      alert('更新失败，请检查网络连接后重试')
+    }
   }
 
   const exportToExcel = () => {
@@ -169,58 +307,32 @@ function App() {
     XLSX.writeFile(wb, fileName)
   }
 
-  // 导出数据为JSON（用于团队同步）
-  const exportData = () => {
-    const dataStr = JSON.stringify(items, null, 2)
-    const dataBlob = new Blob([dataStr], { type: 'application/json' })
-    const url = URL.createObjectURL(dataBlob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `清单数据_${format(new Date(), 'yyyyMMdd_HHmmss')}.json`
-    link.click()
-    URL.revokeObjectURL(url)
+  const deleteItem = async (id) => {
+    if (!confirm('确定删除此事项？')) return
+
+    try {
+      setSyncStatus('syncing')
+      
+      const result = await retryRequest(async () => {
+        return await supabase
+          .from('checklist_items')
+          .delete()
+          .eq('id', id)
+      })
+
+      if (result.error) throw result.error
+
+      await loadItems(false)
+      setSyncStatus('synced')
+    } catch (error) {
+      console.error('删除失败:', error)
+      setSyncStatus('offline')
+      alert('删除失败，请检查网络连接后重试')
+    }
   }
 
-  // 导入数据（用于团队同步）
-  const importData = (event) => {
-    const file = event.target.files[0]
-    if (!file) return
-
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      try {
-        const importedItems = JSON.parse(e.target.result)
-        
-        // 合并数据：保留本地新数据，导入远程数据
-        const mergedItems = [...items]
-        const existingIds = new Set(items.map(item => item.id))
-        
-        importedItems.forEach(importedItem => {
-          if (!existingIds.has(importedItem.id)) {
-            mergedItems.push(importedItem)
-          } else {
-            // 如果ID存在，更新为最新的数据
-            const index = mergedItems.findIndex(item => item.id === importedItem.id)
-            if (index !== -1) {
-              mergedItems[index] = importedItem
-            }
-          }
-        })
-        
-        setItems(mergedItems)
-        alert('数据导入成功！')
-      } catch (error) {
-        alert('导入失败，请确保文件格式正确')
-      }
-    }
-    reader.readAsText(file)
-    event.target.value = '' // 清空input，允许重复导入同一文件
-  }
-
-  const deleteItem = (id) => {
-    if (confirm('确定删除此事项？')) {
-      setItems(items.filter(item => item.id !== id))
-    }
+  const manualSync = () => {
+    loadItems(false)
   }
 
   const getTodayItems = () => {
@@ -270,6 +382,17 @@ function App() {
     )
   }
 
+  if (loading) {
+    return (
+      <div className="login-container">
+        <div className="login-box fade-in">
+          <h1>📋 在线清单管理系统</h1>
+          <p className="login-subtitle">加载中...</p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="app">
       <header className="header fade-in">
@@ -279,6 +402,12 @@ function App() {
             <p className="subtitle">高效管理每日工作事项</p>
           </div>
           <div className="user-section">
+            <div className="sync-status">
+              {syncStatus === 'synced' && isOnline && <span className="status-badge synced">✓ 已同步</span>}
+              {syncStatus === 'syncing' && <span className="status-badge syncing">⟳ 同步中...</span>}
+              {syncStatus === 'offline' && <span className="status-badge offline">⚠ 离线模式</span>}
+              {!isOnline && <button onClick={manualSync} className="sync-btn" title="手动同步">🔄</button>}
+            </div>
             <span className="user-name">👤 {currentUser}</span>
             <button onClick={handleLogout} className="logout-btn">退出</button>
           </div>
@@ -304,23 +433,9 @@ function App() {
         >
           📅 日历查看
         </button>
-        <div className="nav-actions">
-          <label className="import-btn" title="导入数据">
-            📥 导入
-            <input 
-              type="file" 
-              accept=".json" 
-              onChange={importData}
-              style={{ display: 'none' }}
-            />
-          </label>
-          <button onClick={exportData} className="export-btn" title="导出数据（JSON）">
-            💾 导出数据
-          </button>
-          <button onClick={exportToExcel} className="export-btn" title="导出Excel">
-            📊 导出Excel
-          </button>
-        </div>
+        <button onClick={exportToExcel} className="export-btn" title="导出Excel">
+          📊 导出
+        </button>
       </nav>
 
       {view === 'calendar' && (
